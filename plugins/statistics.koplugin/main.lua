@@ -8,6 +8,7 @@ local DocSettings = require("docsettings")
 local InfoMessage = require("ui/widget/infomessage")
 local KeyValuePage = require("ui/widget/keyvaluepage")
 local Math = require("optmath")
+local MultiInputDialog = require("ui/widget/multiinputdialog")
 local ReaderProgress = require("readerprogress")
 local ReadHistory = require("readhistory")
 local SQ3 = require("lua-ljsqlite3/init")
@@ -19,6 +20,7 @@ local ffiUtil = require("ffi/util")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local util = require("util")
+local JSON = require("json")
 local _ = require("gettext")
 local C_ = _.pgettext
 local N_ = _.ngettext
@@ -89,6 +91,8 @@ ReaderStatistics.default_settings = {
     calendar_show_histogram = true,
     calendar_browse_future_months = false,
     color = false,
+    sync_mode = "cloud_storage",
+    serverless_sync_server = nil,
 }
 
 function ReaderStatistics:onDispatcherRegisterActions()
@@ -146,6 +150,12 @@ function ReaderStatistics:init()
     self:resetVolatileStats()
 
     self.settings = G_reader_settings:readSetting("statistics", self.default_settings)
+    if not self.settings.sync_mode then
+        self.settings.sync_mode = "cloud_storage"
+    end
+    if not self.path then
+        self.path = ffiUtil.realpath(DataStorage:getDataDir() .. "/plugins/statistics.koplugin")
+    end
 
     self.ui.menu:registerToMainMenu(self)
     self:onDispatcherRegisterActions()
@@ -1230,6 +1240,32 @@ Time is in hours and minutes.]]),
                         separator = true,
                     },
                     {
+                        text_func = function()
+                            local mode_text = self.settings.sync_mode == "serverless"
+                                and _("Serverless API")
+                                or _("Cloud storage")
+                            return T(_("Sync mode: %1"), mode_text)
+                        end,
+                        sub_item_table = {
+                            {
+                                text = _("Cloud storage"),
+                                checked_func = function() return self.settings.sync_mode ~= "serverless" end,
+                                radio = true,
+                                callback = function()
+                                    self.settings.sync_mode = "cloud_storage"
+                                end,
+                            },
+                            {
+                                text = _("Serverless API"),
+                                checked_func = function() return self.settings.sync_mode == "serverless" end,
+                                radio = true,
+                                callback = function()
+                                    self.settings.sync_mode = "serverless"
+                                end,
+                            },
+                        },
+                    },
+                    {
                         text = _("Cloud sync"),
                         callback = function(touchmenu_instance)
                             local server = self.settings.sync_server
@@ -1296,7 +1332,19 @@ Time is in hours and minutes.]]),
                             }
                             UIManager:show(dialogue)
                         end,
-                        enabled_func = function() return self.settings.is_enabled end,
+                        enabled_func = function()
+                            return self.settings.is_enabled and self.settings.sync_mode ~= "serverless"
+                        end,
+                        keep_menu_open = true,
+                    },
+                    {
+                        text = _("Serverless sync"),
+                        callback = function(touchmenu_instance)
+                            self:editServerlessSyncServer(touchmenu_instance)
+                        end,
+                        enabled_func = function()
+                            return self.settings.is_enabled and self.settings.sync_mode == "serverless"
+                        end,
                         keep_menu_open = true,
                     },
                 },
@@ -3089,8 +3137,89 @@ function ReaderStatistics:getTimeForPages(pages)
     end
 end
 
+function ReaderStatistics:editServerlessSyncServer(touchmenu_instance)
+    local server = self.settings.serverless_sync_server or {}
+    local dialog
+    dialog = MultiInputDialog:new{
+        title = _("Serverless statistics sync"),
+        fields = {
+            {
+                text = server.url,
+                hint = _("Server URL"),
+            },
+            {
+                text = server.username,
+                hint = _("Username"),
+            },
+            {
+                text = server.userkey,
+                hint = _("User key"),
+                text_type = "password",
+            },
+        },
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = _("Delete"),
+                    callback = function()
+                        self.settings.serverless_sync_server = nil
+                        UIManager:close(dialog)
+                        if touchmenu_instance then
+                            touchmenu_instance:updateItems()
+                        end
+                    end,
+                },
+                {
+                    text = _("Save"),
+                    is_enter_default = true,
+                    callback = function()
+                        local url, username, userkey = unpack(dialog:getFields())
+                        url = util.trim(url)
+                        username = util.trim(username)
+                        userkey = util.trim(userkey)
+                        if url == "" or username == "" or userkey == "" then
+                            UIManager:show(InfoMessage:new{
+                                text = _("Server URL, username and user key are required."),
+                                timeout = 2,
+                            })
+                            return
+                        end
+                        self.settings.serverless_sync_server = {
+                            url = url,
+                            username = username,
+                            userkey = userkey,
+                        }
+                        UIManager:close(dialog)
+                        if touchmenu_instance then
+                            touchmenu_instance:updateItems()
+                        end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
 function ReaderStatistics:canSync()
-    return self.settings.sync_server ~= nil and self.settings.is_enabled
+    if not self.settings.is_enabled then
+        return false
+    end
+    if self.settings.sync_mode == "serverless" then
+        local server = self.settings.serverless_sync_server
+        return server and server.url and server.url ~= ""
+            and server.username and server.username ~= ""
+            and server.userkey and server.userkey ~= ""
+    end
+    return self.settings.sync_server ~= nil
 end
 
 function ReaderStatistics:onSyncBookStats()
@@ -3102,8 +3231,177 @@ function ReaderStatistics:onSyncBookStats()
     })
 
     UIManager:nextTick(function()
-        SyncService.sync(self.settings.sync_server, db_location, self.onSync)
+        if self.settings.sync_mode == "serverless" then
+            self:syncBookStatsServerless()
+        else
+            SyncService.sync(self.settings.sync_server, db_location, self.onSync)
+        end
     end)
+end
+
+function ReaderStatistics:getServerlessSyncSnapshot()
+    local conn = SQ3.open(db_location)
+    local books_stmt = conn:prepare([[
+        SELECT id, title, authors, notes, last_open, highlights, pages, series, language, md5, total_read_time, total_read_pages
+        FROM book;
+    ]])
+    local books = {}
+    local result = books_stmt:step()
+    while result do
+        books[#books + 1] = {
+            id = tonumber(result[1]),
+            title = result[2],
+            authors = result[3],
+            notes = tonumber(result[4]) or 0,
+            last_open = tonumber(result[5]) or 0,
+            highlights = tonumber(result[6]) or 0,
+            pages = tonumber(result[7]) or 0,
+            series = result[8],
+            language = result[9],
+            md5 = result[10],
+            total_read_time = tonumber(result[11]) or 0,
+            total_read_pages = tonumber(result[12]) or 0,
+        }
+        result = books_stmt:step()
+    end
+    books_stmt:close()
+
+    local stat_stmt = conn:prepare([[
+        SELECT id_book, page, start_time, duration, total_pages
+        FROM page_stat_data;
+    ]])
+    local stats = {}
+    result = stat_stmt:step()
+    while result do
+        stats[#stats + 1] = {
+            id_book = tonumber(result[1]),
+            page = tonumber(result[2]),
+            start_time = tonumber(result[3]) or 0,
+            duration = tonumber(result[4]) or 0,
+            total_pages = tonumber(result[5]) or 0,
+        }
+        result = stat_stmt:step()
+    end
+    stat_stmt:close()
+    conn:close()
+
+    return {
+        books = books,
+        page_stat_data = stats,
+    }
+end
+
+function ReaderStatistics:applyServerlessSyncSnapshot(snapshot)
+    if type(snapshot) ~= "table" then return false end
+    local books = snapshot.books
+    local stats = snapshot.page_stat_data
+    if type(books) ~= "table" or type(stats) ~= "table" then return false end
+
+    local conn = SQ3.open(db_location)
+    conn:exec("BEGIN;")
+    conn:exec("DELETE FROM page_stat_data;")
+    conn:exec("DELETE FROM book;")
+    local stmt_book = conn:prepare("INSERT INTO book VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);")
+    for _, row in ipairs(books) do
+        stmt_book:reset():bind(
+            tonumber(row.id),
+            row.title,
+            row.authors,
+            tonumber(row.notes) or 0,
+            tonumber(row.last_open) or 0,
+            tonumber(row.highlights) or 0,
+            tonumber(row.pages) or 0,
+            row.series,
+            row.language,
+            row.md5,
+            tonumber(row.total_read_time) or 0,
+            tonumber(row.total_read_pages) or 0
+        ):step()
+    end
+    stmt_book:close()
+
+    local stmt_stats = conn:prepare("INSERT INTO page_stat_data VALUES(?, ?, ?, ?, ?);")
+    for _, row in ipairs(stats) do
+        stmt_stats:reset():bind(
+            tonumber(row.id_book),
+            tonumber(row.page),
+            tonumber(row.start_time) or 0,
+            tonumber(row.duration) or 0,
+            tonumber(row.total_pages) or 0
+        ):step()
+    end
+    stmt_stats:close()
+    conn:exec("COMMIT;")
+    conn:close()
+    return true
+end
+
+function ReaderStatistics:syncBookStatsServerless()
+    local server = self.settings.serverless_sync_server
+    if not server then
+        return
+    end
+
+    if not self.path then
+        UIManager:show(InfoMessage:new{
+            text = _("Cannot find plugin path for serverless sync."),
+            timeout = 3,
+        })
+        return
+    end
+
+    self:insertDB()
+    local StatisticsServerlessClient = require("StatisticsServerlessClient")
+    local client = StatisticsServerlessClient:new{
+        custom_url = server.url,
+        service_spec = self.path .. "/serverless_api.json"
+    }
+    local payload = {
+        schema_version = DB_SCHEMA_VERSION,
+        device = Device.model,
+        device_id = G_reader_settings:readSetting("device_id") or "",
+        snapshot = self:getServerlessSyncSnapshot(),
+    }
+    local snapshot_json = JSON.encode(payload.snapshot)
+    payload.snapshot = snapshot_json
+    local ok, err = pcall(client.sync_statistics,
+        client,
+        server.username,
+        server.userkey,
+        payload,
+        function(cb_ok, body)
+            if cb_ok and body and body.snapshot then
+                local decode_ok, decoded = pcall(JSON.decode, body.snapshot)
+                if decode_ok and self:applyServerlessSyncSnapshot(decoded) then
+                    UIManager:show(InfoMessage:new{
+                        text = _("Successfully synchronized."),
+                        timeout = 2,
+                    })
+                else
+                    UIManager:show(InfoMessage:new{
+                        text = _("Something went wrong when syncing, please check your server response."),
+                        timeout = 3,
+                    })
+                end
+            elseif cb_ok then
+                UIManager:show(InfoMessage:new{
+                    text = _("Successfully synchronized."),
+                    timeout = 2,
+                })
+            else
+                UIManager:show(InfoMessage:new{
+                    text = body and body.message or _("Something went wrong when syncing, please check your network connection and try again later."),
+                    timeout = 3,
+                })
+            end
+        end)
+    if not ok and err then
+        logger.warn("statistics serverless sync failed:", err)
+        UIManager:show(InfoMessage:new{
+            text = _("Something went wrong when syncing, please check your network connection and try again later."),
+            timeout = 3,
+        })
+    end
 end
 
 function ReaderStatistics.onSync(local_path, cached_path, income_path)

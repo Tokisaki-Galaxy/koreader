@@ -1,0 +1,23 @@
+{
+    "base_url" : "https://sync.koreader.rocks:443/",
+    "name" : "koreader-statistics-sync-api",
+    "methods" : {
+        "sync_statistics" : {
+            "path" : "/syncs/statistics",
+            "method" : "PUT",
+            "required_params" : [
+                "schema_version",
+                "device",
+                "device_id",
+                "snapshot"
+            ],
+            "payload" : [
+                "schema_version",
+                "device",
+                "device_id",
+                "snapshot"
+            ],
+            "expected_status" : [200, 202, 401]
+        }
+    }
+}
