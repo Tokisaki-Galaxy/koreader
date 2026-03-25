@@ -24,6 +24,7 @@ function StatisticsServerlessClient:init()
     package.loaded["Spore.Middleware.GinClient"] = {}
     require("Spore.Middleware.GinClient").call = function(_, req)
         req.headers["accept"] = "application/vnd.koreader.v1+json"
+        req.headers["accept-encoding"] = "gzip"
     end
     package.loaded["Spore.Middleware.KOSyncAuth"] = {}
     require("Spore.Middleware.KOSyncAuth").call = function(args, req)
@@ -46,10 +47,10 @@ function StatisticsServerlessClient:sync_statistics(username, userkey, payload, 
     end)
     socketutil:reset_timeout()
     if ok then
-        callback(res.status == 200 or res.status == 202, res.body)
+        callback(res.status == 200 or res.status == 202, res.body, res.status)
     else
         logger.dbg("StatisticsServerlessClient:sync_statistics failure:", res)
-        callback(false, nil)
+        callback(false, nil, nil)
     end
 end
 
