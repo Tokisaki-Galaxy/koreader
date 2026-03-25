@@ -3299,6 +3299,8 @@ function ReaderStatistics:applyServerlessSyncSnapshot(snapshot)
 
     local conn = SQ3.open(db_location)
     conn:exec("BEGIN;")
+    -- Intentionally replace the full local snapshot atomically with server canonical data:
+    -- we treat server response as source of truth to avoid merge conflicts on constrained clients.
     conn:exec("DELETE FROM page_stat_data;")
     conn:exec("DELETE FROM book;")
     local stmt_book = conn:prepare("INSERT INTO book VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);")
@@ -3351,19 +3353,26 @@ function ReaderStatistics:syncBookStatsServerless()
     end
 
     self:insertDB()
-    local StatisticsServerlessClient = require("StatisticsServerlessClient")
+    local StatisticsServerlessClient = require("plugins/statistics.koplugin/StatisticsServerlessClient")
     local client = StatisticsServerlessClient:new{
         custom_url = server.url,
         service_spec = self.path .. "/serverless_api.json"
     }
+    local snapshot = self:getServerlessSyncSnapshot()
+    local ok_snapshot, encoded_snapshot = pcall(JSON.encode, snapshot)
+    if not ok_snapshot then
+        UIManager:show(InfoMessage:new{
+            text = _("Failed to encode statistics snapshot for sync."),
+            timeout = 3,
+        })
+        return
+    end
     local payload = {
         schema_version = DB_SCHEMA_VERSION,
         device = Device.model,
         device_id = G_reader_settings:readSetting("device_id") or "",
-        snapshot = self:getServerlessSyncSnapshot(),
+        snapshot = encoded_snapshot,
     }
-    local snapshot_json = JSON.encode(payload.snapshot)
-    payload.snapshot = snapshot_json
     local ok, err = pcall(client.sync_statistics,
         client,
         server.username,
@@ -3379,7 +3388,7 @@ function ReaderStatistics:syncBookStatsServerless()
                     })
                 else
                     UIManager:show(InfoMessage:new{
-                        text = _("Something went wrong when syncing, please check your server response."),
+                        text = _("Invalid statistics snapshot received from server."),
                         timeout = 3,
                     })
                 end
@@ -3398,7 +3407,7 @@ function ReaderStatistics:syncBookStatsServerless()
     if not ok and err then
         logger.warn("statistics serverless sync failed:", err)
         UIManager:show(InfoMessage:new{
-            text = _("Something went wrong when syncing, please check your network connection and try again later."),
+            text = _("Sync failed. Please try again later."),
             timeout = 3,
         })
     end

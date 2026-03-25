@@ -1,4 +1,3 @@
-local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local socketutil = require("socketutil")
 
@@ -31,29 +30,6 @@ function StatisticsServerlessClient:init()
         req.headers["x-auth-user"] = args.username
         req.headers["x-auth-key"] = args.userkey
     end
-    package.loaded["Spore.Middleware.AsyncHTTP"] = {}
-    require("Spore.Middleware.AsyncHTTP").call = function(args, req)
-        if not UIManager.looper then return end
-        req:finalize()
-        local result
-        require("httpclient"):new():request({
-            url = req.url,
-            method = req.method,
-            body = req.env.spore.payload,
-            on_headers = function(headers)
-                for header, value in pairs(req.headers) do
-                    if type(header) == "string" then
-                        headers:add(header, value)
-                    end
-                end
-            end,
-        }, function(res)
-            result = res
-            result.status = res.code
-            coroutine.resume(args.thread)
-        end)
-        return coroutine.create(function() coroutine.yield(result) end)
-    end
 end
 
 function StatisticsServerlessClient:sync_statistics(username, userkey, payload, callback)
@@ -65,21 +41,16 @@ function StatisticsServerlessClient:sync_statistics(username, userkey, payload, 
         userkey = userkey,
     })
     socketutil:set_timeout(PROGRESS_TIMEOUTS[1], PROGRESS_TIMEOUTS[2])
-    local co = coroutine.create(function()
-        local ok, res = pcall(function()
-            return self.client:sync_statistics(payload)
-        end)
-        if ok then
-            callback(res.status == 200 or res.status == 202, res.body)
-        else
-            logger.dbg("StatisticsServerlessClient:sync_statistics failure:", res)
-            callback(false, res and res.body or nil)
-        end
+    local ok, res = pcall(function()
+        return self.client:sync_statistics(payload)
     end)
-    self.client:enable("AsyncHTTP", { thread = co })
-    coroutine.resume(co)
-    if UIManager.looper then UIManager:setInputTimeout() end
     socketutil:reset_timeout()
+    if ok then
+        callback(res.status == 200 or res.status == 202, res.body)
+    else
+        logger.dbg("StatisticsServerlessClient:sync_statistics failure:", res)
+        callback(false, nil)
+    end
 end
 
 return StatisticsServerlessClient
