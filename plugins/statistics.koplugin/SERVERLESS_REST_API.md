@@ -31,7 +31,9 @@ The authentication model is intentionally aligned with KOReader progress sync
   "schema_version": 20221111,
   "device": "KOReader Device Model",
   "device_id": "device-id-or-empty-string",
-  "snapshot": "{\"books\":[...],\"page_stat_data\":[...]}"
+  "snapshot": {
+    "books": [...]
+  }
 }
 ```
 
@@ -40,7 +42,7 @@ Field details:
 - `schema_version` (`integer`, required): client DB schema version.
 - `device` (`string`, required): device display name/model.
 - `device_id` (`string`, required): KOReader device id (empty string allowed).
-- `snapshot` (`string`, required): JSON-encoded statistics snapshot.
+- `snapshot` (`object`, required): statistics snapshot object.
 
 `snapshot` payload structure:
 
@@ -48,7 +50,6 @@ Field details:
 {
   "books": [
     {
-      "id": 1,
       "title": "Book title",
       "authors": "Author",
       "notes": 0,
@@ -59,20 +60,25 @@ Field details:
       "language": "en",
       "md5": "partial-md5",
       "total_read_time": 1234,
-      "total_read_pages": 88
-    }
-  ],
-  "page_stat_data": [
-    {
-      "id_book": 1,
-      "page": 12,
-      "start_time": 1710000100,
-      "duration": 24,
-      "total_pages": 320
+      "total_read_pages": 88,
+      "page_stat_data": [
+        {
+          "page": 12,
+          "start_time": 1710000100,
+          "duration": 24,
+          "total_pages": 320
+        }
+      ]
     }
   ]
 }
 ```
+
+Important:
+
+- `md5` is the cross-device book identity key.
+- `book.id` and `page_stat_data.id_book` are intentionally not part of the wire format.
+- Server should merge by `md5` and return snapshot in the same md5-based shape.
 
 ### Success responses
 
@@ -84,12 +90,15 @@ Recommended response body:
 ```json
 {
   "ok": true,
-  "snapshot": "{\"books\":[...],\"page_stat_data\":[...]}"
+  "snapshot": {
+    "books": [...]
+  }
 }
 ```
 
 If `snapshot` is returned, KOReader will replace local `book` and
-`page_stat_data` with it atomically.
+`page_stat_data` with it atomically. For safety, when local DB is non-empty,
+KOReader rejects a server snapshot that does not contain any valid md5 books.
 
 ### Error responses
 

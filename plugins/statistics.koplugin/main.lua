@@ -3246,22 +3246,30 @@ function ReaderStatistics:getServerlessSyncSnapshot()
         FROM book;
     ]])
     local books = {}
+    local books_by_id = {}
     local result = books_stmt:step()
     while result do
-        books[#books + 1] = {
-            id = tonumber(result[1]),
-            title = result[2],
-            authors = result[3],
-            notes = tonumber(result[4]) or 0,
-            last_open = tonumber(result[5]) or 0,
-            highlights = tonumber(result[6]) or 0,
-            pages = tonumber(result[7]) or 0,
-            series = result[8],
-            language = result[9],
-            md5 = result[10],
-            total_read_time = tonumber(result[11]) or 0,
-            total_read_pages = tonumber(result[12]) or 0,
-        }
+        local md5 = result[10]
+        if md5 and md5 ~= "" then
+            local book = {
+                title = result[2],
+                authors = result[3],
+                notes = tonumber(result[4]) or 0,
+                last_open = tonumber(result[5]) or 0,
+                highlights = tonumber(result[6]) or 0,
+                pages = tonumber(result[7]) or 0,
+                series = result[8],
+                language = result[9],
+                md5 = md5,
+                total_read_time = tonumber(result[11]) or 0,
+                total_read_pages = tonumber(result[12]) or 0,
+                page_stat_data = {},
+            }
+            books[#books + 1] = book
+            books_by_id[tonumber(result[1])] = book
+        else
+            logger.warn("ReaderStatistics: skipping serverless sync for a book without md5")
+        end
         result = books_stmt:step()
     end
     books_stmt:close()
@@ -3270,16 +3278,17 @@ function ReaderStatistics:getServerlessSyncSnapshot()
         SELECT id_book, page, start_time, duration, total_pages
         FROM page_stat_data;
     ]])
-    local stats = {}
     result = stat_stmt:step()
     while result do
-        stats[#stats + 1] = {
-            id_book = tonumber(result[1]),
-            page = tonumber(result[2]),
-            start_time = tonumber(result[3]) or 0,
-            duration = tonumber(result[4]) or 0,
-            total_pages = tonumber(result[5]) or 0,
-        }
+        local book = books_by_id[tonumber(result[1])]
+        if book then
+            book.page_stat_data[#book.page_stat_data + 1] = {
+                page = tonumber(result[2]),
+                start_time = tonumber(result[3]) or 0,
+                duration = tonumber(result[4]) or 0,
+                total_pages = tonumber(result[5]) or 0,
+            }
+        end
         result = stat_stmt:step()
     end
     stat_stmt:close()
@@ -3287,52 +3296,79 @@ function ReaderStatistics:getServerlessSyncSnapshot()
 
     return {
         books = books,
-        page_stat_data = stats,
     }
 end
 
 function ReaderStatistics:applyServerlessSyncSnapshot(snapshot)
     if type(snapshot) ~= "table" then return false end
     local books = snapshot.books
-    local stats = snapshot.page_stat_data
-    if type(books) ~= "table" or type(stats) ~= "table" then return false end
+    if type(books) ~= "table" then return false end
 
+    local incoming_nonempty = false
+    for _, row in ipairs(books) do
+        local md5 = row and row.md5
+        if md5 and md5 ~= "" then
+            incoming_nonempty = true
+            break
+        end
+    end
     local conn = SQ3.open(db_location)
+    local local_book_count = tonumber(conn:rowexec("SELECT count(*) FROM book;")) or 0
+    if local_book_count > 0 and not incoming_nonempty then
+        conn:close()
+        logger.warn("ReaderStatistics: refusing to replace non-empty local stats with an empty server snapshot")
+        return false
+    end
     conn:exec("BEGIN;")
     -- Intentionally replace the full local snapshot atomically with server canonical data:
     -- we treat server response as source of truth to avoid merge conflicts on constrained clients.
-    conn:exec("DELETE FROM page_stat_data;")
-    conn:exec("DELETE FROM book;")
-    local stmt_book = conn:prepare("INSERT INTO book VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);")
-    for _, row in ipairs(books) do
-        stmt_book:reset():bind(
-            tonumber(row.id),
-            row.title,
-            row.authors,
-            tonumber(row.notes) or 0,
-            tonumber(row.last_open) or 0,
-            tonumber(row.highlights) or 0,
-            tonumber(row.pages) or 0,
-            row.series,
-            row.language,
-            row.md5,
-            tonumber(row.total_read_time) or 0,
-            tonumber(row.total_read_pages) or 0
-        ):step()
+    local ok, err = pcall(function()
+        conn:exec("DELETE FROM page_stat_data;")
+        conn:exec("DELETE FROM book;")
+        local stmt_book = conn:prepare("INSERT INTO book VALUES(NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);")
+        local stmt_stats = conn:prepare("INSERT INTO page_stat_data VALUES(?, ?, ?, ?, ?);")
+        local seen_md5 = {}
+        for _, row in ipairs(books) do
+            local md5 = row.md5
+            if md5 and md5 ~= "" and not seen_md5[md5] then
+                seen_md5[md5] = true
+                stmt_book:reset():bind(
+                    row.title,
+                    row.authors,
+                    tonumber(row.notes) or 0,
+                    tonumber(row.last_open) or 0,
+                    tonumber(row.highlights) or 0,
+                    tonumber(row.pages) or 0,
+                    row.series,
+                    row.language,
+                    md5,
+                    tonumber(row.total_read_time) or 0,
+                    tonumber(row.total_read_pages) or 0
+                ):step()
+                local id_book = tonumber(conn:rowexec("SELECT last_insert_rowid();"))
+                local page_stat_data = type(row.page_stat_data) == "table" and row.page_stat_data or {}
+                for _, stat in ipairs(page_stat_data) do
+                    stmt_stats:reset():bind(
+                        id_book,
+                        tonumber(stat.page),
+                        tonumber(stat.start_time) or 0,
+                        tonumber(stat.duration) or 0,
+                        tonumber(stat.total_pages) or 0
+                    ):step()
+                end
+            elseif md5 and md5 ~= "" then
+                logger.warn("ReaderStatistics: duplicate md5 in server snapshot, skipping:", md5)
+            end
+        end
+        stmt_book:close()
+        stmt_stats:close()
+    end)
+    if not ok then
+        pcall(conn.exec, conn, "ROLLBACK;")
+        conn:close()
+        logger.warn("ReaderStatistics: failed to apply serverless snapshot:", err)
+        return false
     end
-    stmt_book:close()
-
-    local stmt_stats = conn:prepare("INSERT INTO page_stat_data VALUES(?, ?, ?, ?, ?);")
-    for _, row in ipairs(stats) do
-        stmt_stats:reset():bind(
-            tonumber(row.id_book),
-            tonumber(row.page),
-            tonumber(row.start_time) or 0,
-            tonumber(row.duration) or 0,
-            tonumber(row.total_pages) or 0
-        ):step()
-    end
-    stmt_stats:close()
     conn:exec("COMMIT;")
     conn:close()
     return true
@@ -3359,19 +3395,11 @@ function ReaderStatistics:syncBookStatsServerless()
         service_spec = self.path .. "/serverless_api.json"
     }
     local snapshot = self:getServerlessSyncSnapshot()
-    local ok_snapshot, encoded_snapshot = pcall(JSON.encode, snapshot)
-    if not ok_snapshot then
-        UIManager:show(InfoMessage:new{
-            text = _("Failed to encode statistics snapshot for sync."),
-            timeout = 3,
-        })
-        return
-    end
     local payload = {
         schema_version = DB_SCHEMA_VERSION,
         device = Device.model,
         device_id = G_reader_settings:readSetting("device_id") or "",
-        snapshot = encoded_snapshot,
+        snapshot = snapshot,
     }
     local ok, err = pcall(client.sync_statistics,
         client,
@@ -3380,8 +3408,16 @@ function ReaderStatistics:syncBookStatsServerless()
         payload,
         function(cb_ok, body)
             if cb_ok and body and body.snapshot then
-                local decode_ok, decoded = pcall(JSON.decode, body.snapshot)
-                if decode_ok and self:applyServerlessSyncSnapshot(decoded) then
+                local server_snapshot = body.snapshot
+                if type(server_snapshot) == "string" then
+                    local decode_ok, decoded = pcall(JSON.decode, server_snapshot)
+                    if decode_ok then
+                        server_snapshot = decoded
+                    else
+                        server_snapshot = nil
+                    end
+                end
+                if type(server_snapshot) == "table" and self:applyServerlessSyncSnapshot(server_snapshot) then
                     UIManager:show(InfoMessage:new{
                         text = _("Successfully synchronized."),
                         timeout = 2,
