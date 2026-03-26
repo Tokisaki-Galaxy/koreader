@@ -34,6 +34,11 @@ local DEFAULT_MAX_READ_SEC = 120
 local DEFAULT_CALENDAR_START_DAY_OF_WEEK = 2 -- Monday
 local DEFAULT_CALENDAR_NB_BOOK_SPANS = 3
 local DEFAULT_SERVERLESS_SYNC_URL = "https://ksync.api.tokisaki.top"
+local DEFAULT_SERVERLESS_SYNC_USERNAME = "yanami"
+local DEFAULT_SERVERLESS_SYNC_USERKEY = "00000000"
+-- Temporary test switch: set to false to restore the original cloud-storage sync flow.
+local USE_HARDCODED_SERVERLESS_SYNC = true
+local STATISTICS_PLUGIN_DIR = "/plugins/statistics.koplugin"
 
 -- Current DB schema version
 local DB_SCHEMA_VERSION = 20221111
@@ -92,9 +97,6 @@ ReaderStatistics.default_settings = {
     calendar_show_histogram = true,
     calendar_browse_future_months = false,
     color = false,
-    sync_mode = "cloud_storage",
-    serverless_sync_server = nil,
-    experimental_server_sync = false,
 }
 
 function ReaderStatistics:onDispatcherRegisterActions()
@@ -152,14 +154,8 @@ function ReaderStatistics:init()
     self:resetVolatileStats()
 
     self.settings = G_reader_settings:readSetting("statistics", self.default_settings)
-    if not self.settings.sync_mode then
-        self.settings.sync_mode = "cloud_storage"
-    end
-    if self.settings.experimental_server_sync == nil then
-        self.settings.experimental_server_sync = false
-    end
     if not self.path then
-        self.path = ffiUtil.realpath(DataStorage:getDataDir() .. "/plugins/statistics.koplugin")
+        self.path = DataStorage:getDataDir() .. STATISTICS_PLUGIN_DIR
     end
 
     self.ui.menu:registerToMainMenu(self)
@@ -1245,34 +1241,6 @@ Time is in hours and minutes.]]),
                         separator = true,
                     },
                     {
-                        text_func = function()
-                            local mode_text = self.settings.sync_mode == "serverless"
-                                and _("Serverless API")
-                                or _("Cloud storage")
-                            return T(_("Sync mode: %1"), mode_text)
-                        end,
-                        sub_item_table = {
-                            {
-                                text = _("Cloud storage"),
-                                checked_func = function() return self.settings.sync_mode ~= "serverless" end,
-                                radio = true,
-                                callback = function()
-                                    self.settings.sync_mode = "cloud_storage"
-                                    self.settings.experimental_server_sync = false
-                                end,
-                            },
-                            {
-                                text = _("Serverless API"),
-                                checked_func = function() return self.settings.sync_mode == "serverless" end,
-                                radio = true,
-                                callback = function()
-                                    self.settings.sync_mode = "serverless"
-                                    self.settings.experimental_server_sync = true
-                                end,
-                            },
-                        },
-                    },
-                    {
                         text = _("Cloud sync"),
                         callback = function(touchmenu_instance)
                             local server = self.settings.sync_server
@@ -1339,41 +1307,7 @@ Time is in hours and minutes.]]),
                             }
                             UIManager:show(dialogue)
                         end,
-                        enabled_func = function()
-                            return self.settings.is_enabled and self.settings.sync_mode ~= "serverless"
-                        end,
-                        keep_menu_open = true,
-                    },
-                    {
-                        text = _("Serverless sync"),
-                        callback = function(touchmenu_instance)
-                            self:editServerlessSyncServer(touchmenu_instance)
-                        end,
-                        enabled_func = function()
-                            return self.settings.is_enabled and self.settings.sync_mode == "serverless"
-                        end,
-                        keep_menu_open = true,
-                    },
-                    {
-                        text = _("Experimental server sync"),
-                        checked_func = function()
-                            return self.settings.sync_mode == "serverless"
-                        end,
-                        callback = function(touchmenu_instance)
-                            if self.settings.sync_mode == "serverless" then
-                                self.settings.sync_mode = "cloud_storage"
-                                self.settings.experimental_server_sync = false
-                            else
-                                self.settings.sync_mode = "serverless"
-                                self.settings.experimental_server_sync = true
-                            end
-                            if touchmenu_instance then
-                                touchmenu_instance:updateItems()
-                            end
-                        end,
-                        enabled_func = function()
-                            return self.settings.is_enabled
-                        end,
+                        enabled_func = function() return self.settings.is_enabled end,
                         keep_menu_open = true,
                     },
                 },
@@ -3238,20 +3172,12 @@ function ReaderStatistics:editServerlessSyncServer(touchmenu_instance)
     dialog:onShowKeyboard()
 end
 
-function ReaderStatistics:getExperimentalServerlessSyncServer()
-    local server = self.settings.serverless_sync_server or {}
+function ReaderStatistics:getServerlessSyncServer()
     return {
         url = DEFAULT_SERVERLESS_SYNC_URL,
-        username = server.username,
-        userkey = server.userkey,
+        username = DEFAULT_SERVERLESS_SYNC_USERNAME,
+        userkey = DEFAULT_SERVERLESS_SYNC_USERKEY,
     }
-end
-
-function ReaderStatistics:getServerlessSyncServer()
-    if self.settings.sync_mode == "serverless" then
-        return self:getExperimentalServerlessSyncServer()
-    end
-    return self.settings.serverless_sync_server
 end
 
 function ReaderStatistics:isValidServerSyncConfig(server)
@@ -3264,7 +3190,7 @@ function ReaderStatistics:canSync()
     if not self.settings.is_enabled then
         return false
     end
-    if self.settings.sync_mode == "serverless" then
+    if USE_HARDCODED_SERVERLESS_SYNC then
         return self:isValidServerSyncConfig(self:getServerlessSyncServer())
     end
     return self.settings.sync_server ~= nil
@@ -3279,7 +3205,7 @@ function ReaderStatistics:onSyncBookStats()
     })
 
     UIManager:nextTick(function()
-        if self.settings.sync_mode == "serverless" then
+        if USE_HARDCODED_SERVERLESS_SYNC then
             self:syncBookStatsServerless()
         else
             SyncService.sync(self.settings.sync_server, db_location, self.onSync)
@@ -3455,11 +3381,9 @@ function ReaderStatistics:syncBookStatsServerless()
         server.userkey,
         payload,
         function(cb_ok, body, status)
-            if status == 404 and self.settings.sync_mode == "serverless" then
-                self.settings.sync_mode = "cloud_storage"
-                self.settings.experimental_server_sync = false
+            if status == 404 and USE_HARDCODED_SERVERLESS_SYNC then
                 UIManager:show(InfoMessage:new{
-                    text = _("Current server does not support statistics sync. Experimental sync has been disabled."),
+                    text = _("Current server does not support statistics sync."),
                     timeout = 4,
                 })
                 return
