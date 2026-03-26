@@ -33,7 +33,7 @@ local DEFAULT_MIN_READ_SEC = 5
 local DEFAULT_MAX_READ_SEC = 120
 local DEFAULT_CALENDAR_START_DAY_OF_WEEK = 2 -- Monday
 local DEFAULT_CALENDAR_NB_BOOK_SPANS = 3
-local DEFAULT_SYNC_SERVER_URL = "https://sync.koreader.rocks"
+local DEFAULT_SERVERLESS_SYNC_URL = "https://ksync.api.tokisaki.top"
 
 -- Current DB schema version
 local DB_SCHEMA_VERSION = 20221111
@@ -1258,6 +1258,7 @@ Time is in hours and minutes.]]),
                                 radio = true,
                                 callback = function()
                                     self.settings.sync_mode = "cloud_storage"
+                                    self.settings.experimental_server_sync = false
                                 end,
                             },
                             {
@@ -1266,6 +1267,7 @@ Time is in hours and minutes.]]),
                                 radio = true,
                                 callback = function()
                                     self.settings.sync_mode = "serverless"
+                                    self.settings.experimental_server_sync = true
                                 end,
                             },
                         },
@@ -1349,36 +1351,28 @@ Time is in hours and minutes.]]),
                         end,
                         enabled_func = function()
                             return self.settings.is_enabled and self.settings.sync_mode == "serverless"
-                                and not self.settings.experimental_server_sync
                         end,
                         keep_menu_open = true,
                     },
                     {
                         text = _("Experimental server sync"),
                         checked_func = function()
-                            return self.settings.experimental_server_sync
+                            return self.settings.sync_mode == "serverless"
                         end,
                         callback = function(touchmenu_instance)
-                            local enable_experimental = not self.settings.experimental_server_sync
-                            if enable_experimental then
-                                local server = self:getExperimentalServerlessSyncServer()
-                                if not self:isValidServerSyncConfig(server) then
-                                    UIManager:show(InfoMessage:new{
-                                        text = _("Please login to Progress sync first."),
-                                        timeout = 3,
-                                    })
-                                else
-                                    self.settings.experimental_server_sync = true
-                                end
-                            else
+                            if self.settings.sync_mode == "serverless" then
+                                self.settings.sync_mode = "cloud_storage"
                                 self.settings.experimental_server_sync = false
+                            else
+                                self.settings.sync_mode = "serverless"
+                                self.settings.experimental_server_sync = true
                             end
                             if touchmenu_instance then
                                 touchmenu_instance:updateItems()
                             end
                         end,
                         enabled_func = function()
-                            return self.settings.is_enabled and self.settings.sync_mode == "serverless"
+                            return self.settings.is_enabled
                         end,
                         keep_menu_open = true,
                     },
@@ -3245,30 +3239,16 @@ function ReaderStatistics:editServerlessSyncServer(touchmenu_instance)
 end
 
 function ReaderStatistics:getExperimentalServerlessSyncServer()
-    local function has_text(value)
-        return type(value) == "string" and value ~= ""
-    end
-    local server_url = G_reader_settings:readSetting("kosync_server")
-    local username = G_reader_settings:readSetting("kosync_username")
-    local userkey = G_reader_settings:readSetting("kosync_userkey")
-
-    if not has_text(server_url) or not has_text(username) or not has_text(userkey) then
-        local kosync = G_reader_settings:readSetting("kosync", {})
-        server_url = has_text(server_url) and server_url or kosync.custom_server
-        username = has_text(username) and username or kosync.username
-        userkey = has_text(userkey) and userkey or kosync.userkey
-    end
-
-    server_url = has_text(server_url) and server_url or DEFAULT_SYNC_SERVER_URL
+    local server = self.settings.serverless_sync_server or {}
     return {
-        url = server_url,
-        username = username,
-        userkey = userkey,
+        url = DEFAULT_SERVERLESS_SYNC_URL,
+        username = server.username,
+        userkey = server.userkey,
     }
 end
 
 function ReaderStatistics:getServerlessSyncServer()
-    if self.settings.experimental_server_sync then
+    if self.settings.sync_mode == "serverless" then
         return self:getExperimentalServerlessSyncServer()
     end
     return self.settings.serverless_sync_server
@@ -3475,10 +3455,11 @@ function ReaderStatistics:syncBookStatsServerless()
         server.userkey,
         payload,
         function(cb_ok, body, status)
-            if status == 404 and self.settings.experimental_server_sync then
+            if status == 404 and self.settings.sync_mode == "serverless" then
+                self.settings.sync_mode = "cloud_storage"
                 self.settings.experimental_server_sync = false
                 UIManager:show(InfoMessage:new{
-                    text = _("Current sync server does not support statistics sync. Experimental sync has been disabled."),
+                    text = _("Current server does not support statistics sync. Experimental sync has been disabled."),
                     timeout = 4,
                 })
                 return
